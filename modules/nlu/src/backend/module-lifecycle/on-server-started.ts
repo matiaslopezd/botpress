@@ -4,6 +4,7 @@ import _ from 'lodash'
 
 import { Config } from '../../config'
 import Engine from '../engine'
+import legacyElectionPipeline from '../legacy-election'
 import { DucklingEntityExtractor } from '../entities/duckling_extractor'
 import LangProvider from '../language/language-provider'
 import { getPOSTagger, tagSentence } from '../language/pos-tagger'
@@ -79,6 +80,16 @@ async function initDucklingExtractor(bp: typeof sdk): Promise<void> {
 
 const EVENTS_TO_IGNORE = ['session_reference', 'session_reset', 'bp_dialog_timeout', 'visit', 'say_something', '']
 
+const ignoreEvent = (bp: typeof sdk, state: NLUState, event: sdk.IO.IncomingEvent) => {
+  return (
+    !state.nluByBot[event.botId] ||
+    !state.health.isEnabled ||
+    !event.preview ||
+    EVENTS_TO_IGNORE.includes(event.type) ||
+    event.hasFlag(bp.IO.WellKnownFlags.SKIP_NATIVE_NLU)
+  )
+}
+
 const registerMiddleware = async (bp: typeof sdk, state: NLUState) => {
   bp.events.registerMiddleware({
     name: 'nlu.incoming',
@@ -87,13 +98,7 @@ const registerMiddleware = async (bp: typeof sdk, state: NLUState) => {
     description:
       'Process natural language in the form of text. Structured data with an action and parameters for that action is injected in the incoming message event.',
     handler: async (event: sdk.IO.IncomingEvent, next: sdk.IO.MiddlewareNextCallback) => {
-      if (
-        !state.nluByBot[event.botId] ||
-        !state.health.isEnabled ||
-        !event.preview ||
-        EVENTS_TO_IGNORE.includes(event.type) ||
-        event.hasFlag(bp.IO.WellKnownFlags.SKIP_NATIVE_NLU)
-      ) {
+      if (ignoreEvent(bp, state, event)) {
         return next()
       }
 
@@ -140,6 +145,27 @@ const registerMiddleware = async (bp: typeof sdk, state: NLUState) => {
       bp.logger.warn('Error removing sensitive information: ' + err.message)
     }
   }
+
+  bp.events.registerMiddleware({
+    name: 'nlu-election.incoming',
+    direction: 'incoming',
+    order: 11,
+    description: 'Perform intent election for the outputed NLU.',
+    handler: async (event: sdk.IO.IncomingEvent, next: sdk.IO.MiddlewareNextCallback) => {
+      if (ignoreEvent(bp, state, event) || !event.nlu) {
+        return next()
+      }
+
+      try {
+        const nluResults = legacyElectionPipeline(event.nlu)
+        _.merge(event, { nlu: nluResults })
+      } catch (err) {
+        bp.logger.warn('Error extracting metadata for incoming text: ' + err.message)
+      } finally {
+        next()
+      }
+    }
+  })
 }
 
 export function getOnSeverStarted(state: NLUState) {
